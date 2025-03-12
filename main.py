@@ -1,3 +1,5 @@
+
+import re
 import wmi
 import winreg
 import subprocess
@@ -189,19 +191,73 @@ def get_windows_info():
 
 
 def get_cpu_info():
-    """Получение информации о процессоре"""
+    """Получение информации о процессоре с улучшенным форматированием"""
+    cpu_info = {
+        "Модель": "Неизвестно",
+        "Производитель": "Н/Д",
+        "Ядра": "Н/Д",
+        "Потоки": "Н/Д",
+        "Базовая частота": "Н/Д",
+        "Кэш L2": "Н/Д",
+        "Кэш L3": "Н/Д",
+        "Виртуализация": "Неизвестно"
+    }
+
     try:
-        c = wmi.WMI()
-        cpu = c.Win32_Processor()[0]
-        return {
-            "Модель": cpu.Name,
-            "Ядра": cpu.NumberOfCores,
-            "Потоки": cpu.NumberOfLogicalProcessors,
-            "Виртуализация": "Включена" if cpu.VirtualizationFirmwareEnabled else "Выключена"
-        }
+        # Основная информация через WMI
+        try:
+            c = wmi.WMI()
+            processor = c.Win32_Processor()[0]
+
+            # Основные характеристики
+            cpu_info.update({
+                "Модель": getattr(processor, 'Name', 'Неизвестно').strip(),
+                "Ядра": getattr(processor, 'NumberOfCores', 'Н/Д'),
+                "Потоки": getattr(processor, 'NumberOfLogicalProcessors', 'Н/Д'),
+                "Базовая частота": f"{getattr(processor, 'MaxClockSpeed', 0)} МГц",
+                "Виртуализация": "Включена" if getattr(processor, 'VirtualizationFirmwareEnabled',
+                                                       False) else "Выключена"
+            })
+
+        except Exception as wmi_error:
+            logging.error(f"Ошибка WMI: {wmi_error}")
+
+        # Дополнительная информация через PowerShell
+        try:
+            ps_output = subprocess.check_output(
+                ["powershell", "-Command", "Get-WmiObject Win32_Processor | Select-Object *"],
+                text=True,
+                stderr=subprocess.STDOUT,
+                shell=True
+            )
+
+            # Парсинг кэша
+            l2_cache = re.search(r"L2CacheSize\s*:\s*(\d+)", ps_output)
+            l3_cache = re.search(r"L3CacheSize\s*:\s*(\d+)", ps_output)
+
+            if l2_cache:
+                size = int(l2_cache.group(1))
+                cpu_info["Кэш L2"] = f"{size} КБ" if size < 1024 else f"{size / 1024:.1f} МБ"
+
+            if l3_cache:
+                size = int(l3_cache.group(1))
+                cpu_info["Кэш L3"] = f"{size} КБ" if size < 1024 else f"{size / 1024:.1f} МБ"
+
+        except Exception as ps_error:
+            logging.warning(f"Ошибка PowerShell: {ps_error}")
+
+        # Дополнительная проверка виртуализации
+        try:
+            from ctypes import windll
+            if windll.kernel32.IsProcessorFeaturePresent(22):  # PF_VIRT_FIRMWARE_ENABLED
+                cpu_info["Виртуализация"] += " (CPUID)"
+        except:
+            pass
+
     except Exception as e:
-        logging.error(f"Ошибка получения информации CPU: {e}")
-        return {}
+        logging.error(f"Общая ошибка: {e}")
+
+    return cpu_info
 
 
 def check_secure_boot():
@@ -284,25 +340,89 @@ def check_tpm():
 
 
 def check_virtualization():
-    """Проверка виртуализации с улучшенной обработкой"""
+    """Проверка поддержки виртуализации с использованием нескольких методов"""
     try:
-        c = wmi.WMI()
-        system_info = c.Win32_ComputerSystem()[0]
+        result = None
 
-        # Проверка через WMI
-        if hasattr(system_info, 'VirtualizationFirmwareEnabled'):
-            return "Да" if system_info.VirtualizationFirmwareEnabled else "Нет"
+        # Метод 1: Проверка через WMI
+        try:
+            c = wmi.WMI()
+            system_info = c.Win32_ComputerSystem()[0]
+            if hasattr(system_info, 'VirtualizationFirmwareEnabled'):
+                result = "Да" if system_info.VirtualizationFirmwareEnabled else "Нет"
+                logging.info(f"WMI Virtualization: {result}")
+                return result
+        except Exception as wmi_error:
+            logging.warning(f"WMI check failed: {wmi_error}")
 
-        # Альтернативная проверка через реестр
-        virtualization_enabled = get_registry_value(
-            r"HARDWARE\SYSTEM\CurrentControlSet\Control\DeviceGuard",
-            "EnableVirtualizationBasedSecurity"
-        )
-        return "Да" if virtualization_enabled == 1 else "Нет"
+        # Метод 2: Проверка через реестр (Hyper-V)
+        try:
+            hyperv_reg = get_registry_value(
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization",
+                "HypervisorPresent"
+            )
+            if hyperv_reg is not None:
+                result = "Да" if hyperv_reg == 1 else "Нет"
+                logging.info(f"Hyper-V Registry: {result}")
+                return result
+        except Exception as reg_error:
+            logging.warning(f"Hyper-V registry check failed: {reg_error}")
+
+        # Метод 3: Проверка через системную информацию
+        try:
+            output = subprocess.check_output(
+                "systeminfo",
+                text=True,
+                stderr=subprocess.STDOUT,
+                shell=True
+            )
+            if "Virtualization Enabled In Firmware: Yes" in output:
+                result = "Да"
+            elif "Virtualization Enabled In Firmware: No" in output:
+                result = "Нет"
+
+            if result:
+                logging.info(f"Systeminfo check: {result}")
+                return result
+        except Exception as sys_error:
+            logging.warning(f"Systeminfo check failed: {sys_error}")
+
+        # Метод 4: Проверка через PowerShell
+        try:
+            ps_output = subprocess.check_output(
+                ["powershell", "-Command", "(Get-CimInstance Win32_ComputerSystem).HypervisorPresent"],
+                text=True,
+                stderr=subprocess.STDOUT,
+                shell=True
+            ).strip()
+
+            if ps_output.lower() == "true":
+                result = "Да"
+            elif ps_output.lower() == "false":
+                result = "Нет"
+
+            if result:
+                logging.info(f"PowerShell check: {result}")
+                return result
+        except Exception as ps_error:
+            logging.warning(f"PowerShell check failed: {ps_error}")
+
+        # Метод 5: Проверка через CPUID (для процессоров Intel/AMD)
+        try:
+            from ctypes import windll
+            cpu_info = windll.kernel32.IsProcessorFeaturePresent
+            # FEATURE_HYPERVISOR = 0x0000002B (43)
+            result = "Да" if cpu_info(43) else "Нет"
+            logging.info(f"CPUID check: {result}")
+            return result
+        except Exception as cpuid_error:
+            logging.warning(f"CPUID check failed: {cpuid_error}")
+
+        return "Нет (методы проверки недоступны)"
 
     except Exception as e:
-        logging.error(f"Ошибка проверки виртуализации: {e}")
-        return "Ошибка"
+        logging.error(f"Critical virtualization check error: {e}")
+        return "Ошибка проверки"
 
 
 def check_kernel_isolation():
@@ -319,28 +439,118 @@ def check_kernel_isolation():
 
 
 def check_dma_protection():
-    """Проверка защиты DMA"""
+    """Проверка DMA-защиты (возвращает Да/Нет/Ошибка)"""
     try:
-        value = get_registry_value(
-            r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\DmaGuard",
-            "Enabled"
-        )
-        return "Да" if value == 1 else "Нет"
+        protection_found = False
+
+        # 1. Проверка основного ключа реестра
+        try:
+            reg_value = get_registry_value(
+                r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\DmaGuard",
+                "Enabled"
+            )
+            if reg_value == 1:
+                protection_found = True
+        except Exception as e:
+            logging.warning(f"Ошибка реестра DMA: {e}")
+
+        # 2. Проверка через WMI
+        if not protection_found:
+            try:
+                c = wmi.WMI()
+                security_status = c.Win32_DeviceGuard()
+                if security_status and getattr(security_status[0], 'DmaProtectionStatus', 0) == 1:
+                    protection_found = True
+            except Exception as e:
+                logging.warning(f"Ошибка WMI: {e}")
+
+        # 3. Проверка через PowerShell
+        if not protection_found:
+            try:
+                ps_output = subprocess.check_output(
+                    ["powershell", "-Command",
+                     "(Get-CimInstance -Namespace root/Microsoft/Windows/DeviceGuard -ClassName Win32_DeviceGuard).DmaProtectionStatus"],
+                    text=True,
+                    stderr=subprocess.STDOUT,
+                    shell=True
+                )
+                if ps_output.strip() == "1":
+                    protection_found = True
+            except Exception as e:
+                logging.warning(f"Ошибка PowerShell: {e}")
+
+        return "Да" if protection_found else "Нет"
+
     except Exception as e:
-        logging.error(f"Ошибка проверки DMA: {e}")
+        logging.error(f"Критическая ошибка проверки DMA: {e}")
         return "Ошибка"
 
 
 def check_smartscreen():
-    """Проверка SmartScreen"""
+    """Проверка состояния SmartScreen (возвращает Да/Нет/Ошибка)"""
     try:
-        value = get_registry_value(
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
-            "SmartScreenEnabled"
-        )
-        return "Включен" if value in ["RequireAdmin", "Warn", "On"] else "Выключен"
+        enabled = False
+
+        # Проверка основных компонентов
+        try:
+            # Основной ключ для приложений
+            win32_value = get_registry_value(
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
+                "SmartScreenEnabled"
+            )
+            if win32_value in ["RequireAdmin", "Warn", "On"]:
+                enabled = True
+
+            # Проверка для Microsoft Edge
+            edge_value = get_registry_value(
+                r"SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter",
+                "EnabledV9"
+            )
+            if edge_value == 1:
+                enabled = True
+
+            # Проверка для Store приложений
+            store_value = get_registry_value(
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\AppHost",
+                "EnableWebContentEvaluation"
+            )
+            if store_value == 1:
+                enabled = True
+
+        except Exception as reg_error:
+            logging.warning(f"Ошибка реестра: {reg_error}")
+
+        # Дополнительная проверка через PowerShell
+        if not enabled:
+            try:
+                ps_output = subprocess.check_output(
+                    ["powershell", "-Command",
+                     "Get-WindowsOptionalFeature -Online -FeatureName Windows-Defender-SmartScreen"],
+                    text=True,
+                    stderr=subprocess.STDOUT,
+                    shell=True
+                )
+                if "Enabled" in ps_output:
+                    enabled = True
+            except Exception as ps_error:
+                logging.warning(f"Ошибка PowerShell: {ps_error}")
+
+        # Проверка групповых политик
+        if not enabled:
+            try:
+                gpo_value = get_registry_value(
+                    r"SOFTWARE\Policies\Microsoft\Windows\System",
+                    "EnableSmartScreen"
+                )
+                if gpo_value == 1:
+                    enabled = True
+            except Exception as gpo_error:
+                logging.warning(f"Ошибка GPO: {gpo_error}")
+
+        return "Включен" if enabled else "Выключен"
+
     except Exception as e:
-        logging.error(f"Ошибка проверки SmartScreen: {e}")
+        logging.error(f"Критическая ошибка: {e}")
         return "Ошибка"
 
 
@@ -439,11 +649,30 @@ if __name__ == "__main__":
         for k, v in windows_info.items():
             print(f"{k.ljust(15)}: {v}")
 
-        # Процессор
+        # Вывод информации
         cpu_info = get_cpu_info()
-        print(Fore.GREEN + "\n[ПРОЦЕССОР]")
-        for k, v in cpu_info.items():
-            print(f"{k.ljust(15)}: {v}")
+        print(Fore.CYAN + "\n" + "=" * 50)
+        print(Fore.YELLOW + " ХАРАКТЕРИСТИКИ ПРОЦЕССОРА")
+        print(Fore.CYAN + "=" * 50)
+
+        # Форматирование вывода
+        labels = {
+            "Модель": "Модель процессора",
+            "Производитель": "Производитель",
+            "Ядра": "Количество ядер",
+            "Потоки": "Количество потоков",
+            "Базовая частота": "Базовая частота",
+            "Кэш L2": "Кэш второго уровня",
+            "Кэш L3": "Кэш третьего уровня",
+        }
+
+        max_label_length = max(len(label) for label in labels.values())
+
+        for key, label in labels.items():
+            value = cpu_info.get(key, "Н/Д")
+            if isinstance(value, int):
+                value = str(value)
+            print(Fore.WHITE + f"{label.ljust(max_label_length)} : {Fore.GREEN}{value}")
 
         print_header("ПРОВЕРКА БЕЗОПАСНОСТИ")
         print_status("Secure Boot", check_secure_boot())
