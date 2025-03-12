@@ -36,12 +36,22 @@ def run_as_admin():
         logging.error(f"Ошибка при запросе прав администратора: {e}")
         sys.exit(1)
 
-
 def print_header(text):
     """Вывод заголовка с оформлением"""
     print(Fore.CYAN + "\n" + "=" * 50)
     print(Fore.YELLOW + f" {text}")
     print(Fore.CYAN + "=" * 50)
+
+def print_headers():
+    """Вывод кастомного заголовка с версией и автором"""
+    title = "GAMEBREAKER CHECKER - СИСТЕМНАЯ ИНФОРМАЦИЯ"
+    version_info = "v 1.0 by Voldemort1337"
+
+    print(Fore.CYAN + "\n" + "=" * 60)
+    print(Fore.RED + f" {title.center(58)}")
+    print(Fore.CYAN + "-" * 60)
+    print(Fore.YELLOW + f" {version_info.rjust(57)} ")
+    print(Fore.CYAN + "=" * 60)
 
 
 def print_status(item, status):
@@ -621,7 +631,8 @@ if __name__ == "__main__":
     run_as_admin()
 
     try:
-        print_header("СИСТЕМНАЯ ИНФОРМАЦИЯ")
+
+        print_headers()
 
         # BIOS
         bios_info = get_bios_info()
