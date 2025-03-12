@@ -200,8 +200,8 @@ def get_windows_info():
         return {"Ошибка": str(e)}
 
 
-def get_cpu_info():
-    """Получение информации о процессоре с улучшенным форматированием"""
+def get_cpu_info(virtualization_status=None):
+    """Получение информации о процессоре с синхронизированной проверкой виртуализации"""
     cpu_info = {
         "Модель": "Неизвестно",
         "Производитель": "Н/Д",
@@ -219,18 +219,27 @@ def get_cpu_info():
             c = wmi.WMI()
             processor = c.Win32_Processor()[0]
 
-            # Основные характеристики
             cpu_info.update({
                 "Модель": getattr(processor, 'Name', 'Неизвестно').strip(),
                 "Ядра": getattr(processor, 'NumberOfCores', 'Н/Д'),
                 "Потоки": getattr(processor, 'NumberOfLogicalProcessors', 'Н/Д'),
                 "Базовая частота": f"{getattr(processor, 'MaxClockSpeed', 0)} МГц",
-                "Виртуализация": "Включена" if getattr(processor, 'VirtualizationFirmwareEnabled',
-                                                       False) else "Выключена"
             })
 
         except Exception as wmi_error:
             logging.error(f"Ошибка WMI: {wmi_error}")
+
+        # Синхронизация статуса виртуализации
+        if virtualization_status is not None:
+            cpu_info["Виртуализация"] = virtualization_status
+        else:
+            try:
+                # Используем общий метод проверки
+                from ctypes import windll
+                virt_status = "Включена" if windll.kernel32.IsProcessorFeaturePresent(22) else "Выключена"
+                cpu_info["Виртуализация"] = virt_status
+            except Exception as virt_error:
+                logging.warning(f"Ошибка проверки виртуализации: {virt_error}")
 
         # Дополнительная информация через PowerShell
         try:
@@ -247,22 +256,14 @@ def get_cpu_info():
 
             if l2_cache:
                 size = int(l2_cache.group(1))
-                cpu_info["Кэш L2"] = f"{size} КБ" if size < 1024 else f"{size / 1024:.1f} МБ"
+                cpu_info["Кэш L2"] = f"{size} КБ" if size < 1024 else f"{size/1024:.1f} МБ"
 
             if l3_cache:
                 size = int(l3_cache.group(1))
-                cpu_info["Кэш L3"] = f"{size} КБ" if size < 1024 else f"{size / 1024:.1f} МБ"
+                cpu_info["Кэш L3"] = f"{size} КБ" if size < 1024 else f"{size/1024:.1f} МБ"
 
         except Exception as ps_error:
             logging.warning(f"Ошибка PowerShell: {ps_error}")
-
-        # Дополнительная проверка виртуализации
-        try:
-            from ctypes import windll
-            if windll.kernel32.IsProcessorFeaturePresent(22):  # PF_VIRT_FIRMWARE_ENABLED
-                cpu_info["Виртуализация"] += " (CPUID)"
-        except:
-            pass
 
     except Exception as e:
         logging.error(f"Общая ошибка: {e}")
@@ -350,88 +351,54 @@ def check_tpm():
 
 
 def check_virtualization():
-    """Проверка поддержки виртуализации с использованием нескольких методов"""
+    """Проверка виртуализации через те же методы, что и в get_cpu_info"""
     try:
-        result = None
-
-        # Метод 1: Проверка через WMI
+        # Метод 1: WMI (как в get_cpu_info)
         try:
             c = wmi.WMI()
-            system_info = c.Win32_ComputerSystem()[0]
-            if hasattr(system_info, 'VirtualizationFirmwareEnabled'):
-                result = "Да" if system_info.VirtualizationFirmwareEnabled else "Нет"
-                logging.info(f"WMI Virtualization: {result}")
-                return result
+            processor = c.Win32_Processor()[0]
+            if getattr(processor, 'VirtualizationFirmwareEnabled', False):
+                return "Да"
         except Exception as wmi_error:
-            logging.warning(f"WMI check failed: {wmi_error}")
+            logging.warning(f"WMI Error: {wmi_error}")
 
-        # Метод 2: Проверка через реестр (Hyper-V)
+        # Метод 2: Реестр (аналогично get_cpu_info)
         try:
-            hyperv_reg = get_registry_value(
-                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization",
-                "HypervisorPresent"
+            reg_value = get_registry_value(
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                "FeatureSet"
             )
-            if hyperv_reg is not None:
-                result = "Да" if hyperv_reg == 1 else "Нет"
-                logging.info(f"Hyper-V Registry: {result}")
-                return result
+            if reg_value and (reg_value & 0x80000000):  # Проверка бита виртуализации
+                return "Да"
         except Exception as reg_error:
-            logging.warning(f"Hyper-V registry check failed: {reg_error}")
+            logging.warning(f"Registry Error: {reg_error}")
 
-        # Метод 3: Проверка через системную информацию
-        try:
-            output = subprocess.check_output(
-                "systeminfo",
-                text=True,
-                stderr=subprocess.STDOUT,
-                shell=True
-            )
-            if "Virtualization Enabled In Firmware: Yes" in output:
-                result = "Да"
-            elif "Virtualization Enabled In Firmware: No" in output:
-                result = "Нет"
-
-            if result:
-                logging.info(f"Systeminfo check: {result}")
-                return result
-        except Exception as sys_error:
-            logging.warning(f"Systeminfo check failed: {sys_error}")
-
-        # Метод 4: Проверка через PowerShell
+        # Метод 3: PowerShell (как в get_cpu_info)
         try:
             ps_output = subprocess.check_output(
-                ["powershell", "-Command", "(Get-CimInstance Win32_ComputerSystem).HypervisorPresent"],
+                ["powershell", "-Command", "(Get-WmiObject Win32_Processor).VirtualizationFirmwareEnabled"],
                 text=True,
                 stderr=subprocess.STDOUT,
                 shell=True
             ).strip()
 
-            if ps_output.lower() == "true":
-                result = "Да"
-            elif ps_output.lower() == "false":
-                result = "Нет"
-
-            if result:
-                logging.info(f"PowerShell check: {result}")
-                return result
+            if ps_output.lower() in ["true", "1"]:
+                return "Да"
         except Exception as ps_error:
-            logging.warning(f"PowerShell check failed: {ps_error}")
+            logging.warning(f"PowerShell Error: {ps_error}")
 
-        # Метод 5: Проверка через CPUID (для процессоров Intel/AMD)
+        # Метод 4: CPUID (как в get_cpu_info)
         try:
             from ctypes import windll
-            cpu_info = windll.kernel32.IsProcessorFeaturePresent
-            # FEATURE_HYPERVISOR = 0x0000002B (43)
-            result = "Да" if cpu_info(43) else "Нет"
-            logging.info(f"CPUID check: {result}")
-            return result
+            if windll.kernel32.IsProcessorFeaturePresent(22):  # 22 = PF_VIRT_FIRMWARE_ENABLED
+                return "Да"
         except Exception as cpuid_error:
-            logging.warning(f"CPUID check failed: {cpuid_error}")
+            logging.warning(f"CPUID Error: {cpuid_error}")
 
-        return "Нет (методы проверки недоступны)"
+        return "Нет"
 
     except Exception as e:
-        logging.error(f"Critical virtualization check error: {e}")
+        logging.error(f"Critical Error: {e}")
         return "Ошибка проверки"
 
 
@@ -497,71 +464,25 @@ def check_dma_protection():
 
 
 def check_smartscreen():
-    """Проверка состояния SmartScreen (возвращает Да/Нет/Ошибка)"""
+    """Проверка через PowerShell"""
     try:
-        enabled = False
+        result = subprocess.run(
+            ["powershell", "-Command",
+             "Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer' | Select-Object SmartScreenEnabled"],
+            capture_output=True,
+            text=True,
+            shell=True
+        )
+        output = result.stdout.lower()
 
-        # Проверка основных компонентов
-        try:
-            # Основной ключ для приложений
-            win32_value = get_registry_value(
-                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
-                "SmartScreenEnabled"
-            )
-            if win32_value in ["RequireAdmin", "Warn", "On"]:
-                enabled = True
-
-            # Проверка для Microsoft Edge
-            edge_value = get_registry_value(
-                r"SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter",
-                "EnabledV9"
-            )
-            if edge_value == 1:
-                enabled = True
-
-            # Проверка для Store приложений
-            store_value = get_registry_value(
-                r"SOFTWARE\Microsoft\Windows\CurrentVersion\AppHost",
-                "EnableWebContentEvaluation"
-            )
-            if store_value == 1:
-                enabled = True
-
-        except Exception as reg_error:
-            logging.warning(f"Ошибка реестра: {reg_error}")
-
-        # Дополнительная проверка через PowerShell
-        if not enabled:
-            try:
-                ps_output = subprocess.check_output(
-                    ["powershell", "-Command",
-                     "Get-WindowsOptionalFeature -Online -FeatureName Windows-Defender-SmartScreen"],
-                    text=True,
-                    stderr=subprocess.STDOUT,
-                    shell=True
-                )
-                if "Enabled" in ps_output:
-                    enabled = True
-            except Exception as ps_error:
-                logging.warning(f"Ошибка PowerShell: {ps_error}")
-
-        # Проверка групповых политик
-        if not enabled:
-            try:
-                gpo_value = get_registry_value(
-                    r"SOFTWARE\Policies\Microsoft\Windows\System",
-                    "EnableSmartScreen"
-                )
-                if gpo_value == 1:
-                    enabled = True
-            except Exception as gpo_error:
-                logging.warning(f"Ошибка GPO: {gpo_error}")
-
-        return "Включен" if enabled else "Выключен"
+        if "requireadmin" in output: return "Включен"
+        if "warn" in output: return "Включен"
+        if "on" in output: return "Включен"
+        if "off" in output: return "Выключен"
+        return "Неизвестный статус"
 
     except Exception as e:
-        logging.error(f"Критическая ошибка: {e}")
-        return "Ошибка"
+        return f"Ошибка: {str(e)}"
 
 
 def check_defender():
@@ -580,13 +501,46 @@ def check_defender():
 
 
 def check_firewall():
-    """Проверка брандмауэра"""
+    """Проверка статуса брандмауэра (возвращает Активен/Не активен/Ошибка)"""
     try:
-        c = wmi.WMI()
-        service = c.Win32_Service(Name="MpsSvc")[0]
-        return "Активен" if service.State == "Running" else "Выключен"
+        # Проверка базового состояния службы
+        try:
+            c = wmi.WMI()
+            service = c.Win32_Service(Name="MpsSvc")[0]
+            if service.State != "Running":
+                return "Неактивен"
+        except Exception as e:
+            logging.warning(f"Ошибка WMI: {e}")
+
+        # Проверка активных профилей
+        try:
+            ps_output = subprocess.check_output(
+                ["powershell", "-Command",
+                 "(Get-NetFirewallProfile | Where-Object {$_.Enabled -eq 'True'}) -ne $null"],
+                text=True,
+                stderr=subprocess.STDOUT,
+                shell=True
+            )
+            if "True" in ps_output:
+                return "Активен"
+        except Exception as e:
+            logging.warning(f"Ошибка PowerShell: {e}")
+
+        # Дополнительная проверка через реестр
+        try:
+            domain_enabled = get_registry_value(
+                r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile",
+                "EnableFirewall"
+            )
+            if domain_enabled == 1:
+                return "Активен"
+        except Exception as e:
+            logging.warning(f"Ошибка реестра: {e}")
+
+        return "Неактивен"
+
     except Exception as e:
-        logging.error(f"Ошибка проверки брандмауэра: {e}")
+        logging.error(f"Критическая ошибка: {e}")
         return "Ошибка"
 
 
@@ -675,6 +629,7 @@ if __name__ == "__main__":
             "Базовая частота": "Базовая частота",
             "Кэш L2": "Кэш второго уровня",
             "Кэш L3": "Кэш третьего уровня",
+            "Виртуализация": "Виртуализация"
         }
 
         max_label_length = max(len(label) for label in labels.values())
