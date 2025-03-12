@@ -7,19 +7,32 @@ import sys
 from datetime import datetime
 from colorama import Fore, init
 import json
+import logging
+
 # Инициализация цветного вывода
 init(autoreset=True)
+
+# Настройка логирования
+logging.basicConfig(
+    filename='system_check.log',
+    level=logging.ERROR,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 
 def run_as_admin():
     """Перезапуск скрипта с правами администратора"""
-    if not ctypes.windll.shell32.IsUserAnAdmin():
-        script = os.path.abspath(sys.argv[0])
-        params = ' '.join([script] + sys.argv[1:])
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, params, None, 1
-        )
-        sys.exit(0)
+    try:
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            script = os.path.abspath(sys.argv[0])
+            params = ' '.join([script] + sys.argv[1:])
+            ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, None, 1
+            )
+            sys.exit(0)
+    except Exception as e:
+        logging.error(f"Ошибка при запросе прав администратора: {e}")
+        sys.exit(1)
 
 
 def print_header(text):
@@ -40,7 +53,8 @@ def format_bios_date(bios_date):
     """Преобразование даты BIOS в читаемый формат"""
     try:
         return datetime.strptime(bios_date.split('.')[0], "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
-    except:
+    except Exception as e:
+        logging.error(f"Ошибка формата даты BIOS: {e}")
         return bios_date
 
 
@@ -56,11 +70,12 @@ def get_bios_info():
             "Режим BIOS": "UEFI" if bios.BiosCharacteristics and 41 in bios.BiosCharacteristics else "Legacy"
         }
     except Exception as e:
+        logging.error(f"Ошибка получения информации BIOS: {e}")
         return {"Ошибка": str(e)}
 
 
 def check_partition_style_powershell():
-    """Получение стиля разделов через PowerShell с улучшенной обработкой ошибок"""
+    """Получение стиля разделов через PowerShell"""
     try:
         output = subprocess.check_output(
             ["powershell", "Get-Disk | Select-Object Number, PartitionStyle | ConvertTo-Json"],
@@ -69,137 +84,112 @@ def check_partition_style_powershell():
             shell=True
         ).strip()
 
-        if not output:
-            return {}
+        disks = json.loads(output) if output else []
 
-        disks = json.loads(output)
-
-        # Обработка разных форматов вывода
-        if isinstance(disks, dict):  # Для одного диска
+        if isinstance(disks, dict):
             return {disks["Number"]: disks["PartitionStyle"]}
-        elif isinstance(disks, list):  # Для нескольких дисков
+        if isinstance(disks, list):
             return {disk["Number"]: disk["PartitionStyle"] for disk in disks}
-
         return {}
 
     except Exception as e:
-        print(Fore.RED + f"Ошибка PowerShell: {str(e)}")
-        print(Fore.YELLOW + f"Вывод команды: {output if 'output' in locals() else ''}")
+        output = locals().get('output', '')
+        logging.error(f"Ошибка PowerShell: {e}\nВывод: {output}")
         return {}
+
 
 def format_size(size_bytes):
     """Форматирование размера в читаемый вид"""
     try:
         return f"{int(int(size_bytes) // (1024 ** 3))} GB" if size_bytes else "0 GB"
-    except:
+    except Exception as e:
+        logging.error(f"Ошибка форматирования размера: {e}")
         return "Н/Д"
 
+
 def get_disk_partitions():
-    """Получение информации о дисках с улучшенной обработкой ошибок"""
+    """Получение информации о дисках и разделах"""
     try:
         result = []
         c = wmi.WMI()
         ps_style = check_partition_style_powershell()
 
         for physical_disk in c.Win32_DiskDrive():
+            disk_info = {
+                "Физический диск": getattr(physical_disk, "Caption", "Неизвестно"),
+                "Номер": int(getattr(physical_disk, "Index", -1)),
+                "Стиль раздела": "Неизвестно",
+                "Размер": format_size(getattr(physical_disk, "Size", 0)),
+                "Разделы": []
+            }
+
             try:
-                disk_info = {
-                    "Физический диск": getattr(physical_disk, "Caption", "Неизвестно"),
-                    "Номер": int(getattr(physical_disk, "Index", -1)),
-                    "Стиль раздела": "Неизвестно",
-                    "Размер": format_size(getattr(physical_disk, "Size", 0)),
-                    "Разделы": []
-                }
-
-                # Определение стиля раздела
-                try:
-                    disk_info["Стиль раздела"] = ps_style.get(
-                        disk_info["Номер"],
-                        {1: "MBR", 2: "GPT"}.get(
-                            int(getattr(physical_disk, "PartitionStyle", 0)),
-                            "Неизвестно"
-                        )
+                disk_info["Стиль раздела"] = ps_style.get(
+                    disk_info["Номер"],
+                    {1: "MBR", 2: "GPT"}.get(
+                        int(getattr(physical_disk, "PartitionStyle", 0)),
+                        "Неизвестно"
                     )
-                except Exception as e:
-                    disk_info["Стиль раздела"] = f"Ошибка: {str(e)}"
-
-                # Получение информации о разделах
-                try:
-                    for partition in physical_disk.associators("Win32_DiskDriveToDiskPartition"):
-                        for logical_disk in partition.associators("Win32_LogicalDiskToPartition"):
-                            disk_info["Разделы"].append({
-                                "Буква": getattr(logical_disk, "Caption", "Без буквы"),
-                                "Файловая система": getattr(logical_disk, "FileSystem", "Неизвестно"),
-                                "Размер": format_size(getattr(logical_disk, "Size", 0)),
-                                "Свободно": format_size(getattr(logical_disk, "FreeSpace", 0))
-                            })
-                except Exception as e:
-                    disk_info["Ошибка разделов"] = str(e)
-
-                result.append(disk_info)
-
+                )
             except Exception as e:
-                print(Fore.RED + f"Ошибка обработки диска: {str(e)}")
-                continue
+                logging.error(f"Ошибка определения стиля раздела: {e}")
 
+            try:
+                for partition in physical_disk.associators("Win32_DiskDriveToDiskPartition"):
+                    for logical_disk in partition.associators("Win32_LogicalDiskToPartition"):
+                        disk_info["Разделы"].append({
+                            "Буква": getattr(logical_disk, "Caption", "Без буквы"),
+                            "Файловая система": getattr(logical_disk, "FileSystem", "Неизвестно"),
+                            "Размер": format_size(getattr(logical_disk, "Size", 0)),
+                            "Свободно": format_size(getattr(logical_disk, "FreeSpace", 0))
+                        })
+            except Exception as e:
+                logging.error(f"Ошибка получения разделов: {e}")
+
+            result.append(disk_info)
         return result
 
     except Exception as e:
-        print(Fore.RED + f"Критическая ошибка: {str(e)}")
+        logging.error(f"Критическая ошибка дисков: {e}")
         return []
 
 
-
+def get_registry_value(key_path, value_name):
+    """Получение значения из реестра"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            value, _ = winreg.QueryValueEx(key, value_name)
+            return value
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка реестра {key_path}: {e}")
+        return None
 
 
 def get_windows_info():
     """Получение информации о Windows"""
     try:
         c = wmi.WMI()
-        os_info = c.Win32_OperatingSystem()[0]  # Получаем первый объект ОС
+        os_info = c.Win32_OperatingSystem()[0]
 
-        result = {}
-
-        # Проверка и добавление данных с обработкой исключений
-        try:
-            result["Версия"] = os_info.Caption
-        except AttributeError:
-            result["Версия"] = "Неизвестно"
-
-        try:
-            result["Сборка"] = os_info.BuildNumber
-        except AttributeError:
-            result["Сборка"] = "Н/Д"
-
-        try:
-            result["Архитектура"] = os_info.OSArchitecture
-        except AttributeError:
-            result["Архитектура"] = "Н/Д"
-
-        try:
-            result["Лицензия"] = "Активирована" if os_info.LicenseStatus == 1 else "Не активирована"
-        except AttributeError:
-            result["Лицензия"] = "Статус неизвестен"
-
-        try:
-            install_date = datetime.strptime(os_info.InstallDate.split('.')[0], "%Y%m%d%H%M%S")
-            result["Дата установки"] = install_date.strftime("%Y-%m-%d %H:%M:%S")
-        except:
-            result["Дата установки"] = "Н/Д"
-
-        return result
-
-    except Exception as e:
-        print(Fore.RED + f"\nОшибка получения данных ОС: {str(e)}")
         return {
-            "Версия": "Ошибка",
-            "Сборка": "Ошибка",
-            "Архитектура": "Ошибка",
-            "Лицензия": "Ошибка"
+            "Версия": getattr(os_info, 'Caption', 'Неизвестно'),
+            "Сборка": getattr(os_info, 'BuildNumber', 'Н/Д'),
+            "Архитектура": getattr(os_info, 'OSArchitecture', 'Н/Д'),
+            "Лицензия": "Активирована" if getattr(os_info, 'LicenseStatus', 0) == 1 else "Не активирована",
+            "Дата установки": datetime.strptime(
+                os_info.InstallDate.split('.')[0],
+                "%Y%m%d%H%M%S"
+            ).strftime("%Y-%m-%d %H:%M:%S") if hasattr(os_info, 'InstallDate') else "Н/Д"
         }
+    except Exception as e:
+        logging.error(f"Ошибка получения информации ОС: {e}")
+        return {"Ошибка": str(e)}
 
 
 def get_cpu_info():
+    """Получение информации о процессоре"""
     try:
         c = wmi.WMI()
         cpu = c.Win32_Processor()[0]
@@ -209,130 +199,212 @@ def get_cpu_info():
             "Потоки": cpu.NumberOfLogicalProcessors,
             "Виртуализация": "Включена" if cpu.VirtualizationFirmwareEnabled else "Выключена"
         }
-    except:
+    except Exception as e:
+        logging.error(f"Ошибка получения информации CPU: {e}")
         return {}
 
 
-def get_gpu_info():
-    try:
-        c = wmi.WMI()
-        return [{"Модель": gpu.Name, "Память": f"{int(gpu.AdapterRAM / (1024 ** 3))} GB"} for gpu in
-                c.Win32_VideoController()]
-    except:
-        return []
-
-
 def check_secure_boot():
+    """Проверка Secure Boot"""
     try:
         output = subprocess.check_output(
-            ["powershell", "Confirm-SecureBootUEFI"],
-            text=True, stderr=subprocess.STDOUT
-        ).strip()
-        return "Да" if output == "True" else "Нет"
-    except subprocess.CalledProcessError as e:
+            ["powershell", "-Command", "Confirm-SecureBootUEFI"],
+            text=True,
+            stderr=subprocess.STDOUT
+        ).strip().lower()
+        return "Да" if output == "true" else "Нет"
+    except subprocess.CalledProcessError:
         return "Не поддерживается"
+    except Exception as e:
+        logging.error(f"Ошибка Secure Boot: {e}")
+        return "Ошибка"
 
 
 def check_tpm():
+    """Проверка TPM модуля с многоуровневой диагностикой"""
     try:
-        c = wmi.WMI()
-        tpm = c.Win32_Tpm()[0]
-        return "Да" if tpm.IsActivated_InitialValue and tpm.IsEnabled_InitialValue else "Нет"
-    except:
+        # Метод 1: Проверка через WMI
+        try:
+            c = wmi.WMI()
+            tpm_list = c.Win32_Tpm()
+            if tpm_list:
+                tpm = tpm_list[0]
+                activated = getattr(tpm, 'IsActivated_InitialValue', False)
+                enabled = getattr(tpm, 'IsEnabled_InitialValue', False)
+                if activated and enabled:
+                    return "Да"
+        except Exception as wmi_error:
+            logging.warning(f"WMI TPM check failed: {wmi_error}")
+
+        # Метод 2: Проверка через реестр
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\TPM") as key:
+                device_name = winreg.QueryValueEx(key, "DeviceName")[0]
+                if device_name:
+                    return "Да (обнаружен в реестре)"
+        except FileNotFoundError:
+            pass
+        except Exception as reg_error:
+            logging.warning(f"Registry TPM check failed: {reg_error}")
+
+        # Метод 3: Проверка через PowerShell
+        try:
+            ps_output = subprocess.check_output(
+                ["powershell", "-Command", "$tpm = Get-Tpm; $tpm.TpmPresent"],
+                text=True,
+                stderr=subprocess.STDOUT,
+                shell=True
+            ).strip()
+
+            if ps_output.lower() == "true":
+                return "Да"
+            elif ps_output.lower() == "false":
+                return "Нет"
+        except Exception as ps_error:
+            logging.warning(f"PowerShell TPM check failed: {ps_error}")
+
+        # Метод 4: Проверка через systeminfo
+        try:
+            output = subprocess.check_output(
+                "systeminfo",
+                text=True,
+                stderr=subprocess.STDOUT,
+                shell=True
+            )
+            if "TPM" in output and "2.0" in output:
+                return "Да (TPM 2.0)"
+        except Exception as sys_error:
+            logging.warning(f"Systeminfo check failed: {sys_error}")
+
         return "Нет"
+
+    except Exception as e:
+        logging.error(f"Critical TPM check error: {e}")
+        return "Ошибка проверки"
 
 
 def check_virtualization():
+    """Проверка виртуализации с улучшенной обработкой"""
     try:
         c = wmi.WMI()
-        return "Да" if c.Win32_ComputerSystem()[0].VirtualizationFirmwareEnabled else "Нет"
-    except:
-        return "Нет"
+        system_info = c.Win32_ComputerSystem()[0]
+
+        # Проверка через WMI
+        if hasattr(system_info, 'VirtualizationFirmwareEnabled'):
+            return "Да" if system_info.VirtualizationFirmwareEnabled else "Нет"
+
+        # Альтернативная проверка через реестр
+        virtualization_enabled = get_registry_value(
+            r"HARDWARE\SYSTEM\CurrentControlSet\Control\DeviceGuard",
+            "EnableVirtualizationBasedSecurity"
+        )
+        return "Да" if virtualization_enabled == 1 else "Нет"
+
+    except Exception as e:
+        logging.error(f"Ошибка проверки виртуализации: {e}")
+        return "Ошибка"
 
 
 def check_kernel_isolation():
+    """Проверка изоляции ядра"""
     try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity"
+        value = get_registry_value(
+            r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity",
+            "Enabled"
         )
-        value, _ = winreg.QueryValueEx(key, "Enabled")
         return "Да" if value == 1 else "Нет"
-    except:
-        return "Нет"
+    except Exception as e:
+        logging.error(f"Ошибка проверки изоляции ядра: {e}")
+        return "Ошибка"
 
 
 def check_dma_protection():
+    """Проверка защиты DMA"""
     try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"Software\Policies\Microsoft\Windows\Kernel DMA Protection"
+        value = get_registry_value(
+            r"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\DmaGuard",
+            "Enabled"
         )
-        value, _ = winreg.QueryValueEx(key, "DeviceEnumerationPolicy")
         return "Да" if value == 1 else "Нет"
-    except:
-        return "Нет"
+    except Exception as e:
+        logging.error(f"Ошибка проверки DMA: {e}")
+        return "Ошибка"
 
 
 def check_smartscreen():
+    """Проверка SmartScreen"""
     try:
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer"
+        value = get_registry_value(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
+            "SmartScreenEnabled"
         )
-        value, _ = winreg.QueryValueEx(key, "SmartScreenEnabled")
         return "Включен" if value in ["RequireAdmin", "Warn", "On"] else "Выключен"
-    except:
-        return "Ошибка проверки"
+    except Exception as e:
+        logging.error(f"Ошибка проверки SmartScreen: {e}")
+        return "Ошибка"
 
 
 def check_defender():
+    """Проверка Windows Defender"""
     try:
         c = wmi.WMI()
-        service = c.Win32_Service(Name='WinDefend')[0]
-        key = winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows Defender\Real-Time Protection"
-        )
-        rt_disabled, _ = winreg.QueryValueEx(key, "DisableRealtimeMonitoring")
-        return "Активен" if service.State == 'Running' and rt_disabled == 0 else "Неактивен"
-    except:
-        return "Ошибка проверки"
+        service = c.Win32_Service(Name="WinDefend")[0]
+        rt_disabled = get_registry_value(
+            r"SOFTWARE\Microsoft\Windows Defender\Real-Time Protection",
+            "DisableRealtimeMonitoring"
+        ) or 0
+        return "Активен" if service.State == "Running" and rt_disabled == 0 else "Неактивен"
+    except Exception as e:
+        logging.error(f"Ошибка проверки Defender: {e}")
+        return "Ошибка"
 
 
 def check_firewall():
+    """Проверка брандмауэра"""
     try:
         c = wmi.WMI()
-        service = c.Win32_Service(Name='MpsSvc')[0]
-        return "Активен" if service.State == 'Running' else "Выключен"
-    except:
-        return "Ошибка проверки"
+        service = c.Win32_Service(Name="MpsSvc")[0]
+        return "Активен" if service.State == "Running" else "Выключен"
+    except Exception as e:
+        logging.error(f"Ошибка проверки брандмауэра: {e}")
+        return "Ошибка"
 
 
 def check_installed_software(keywords):
-    found = []
+    """Поиск установленных программ по ключевым словам"""
+    found = set()
     try:
-        c = wmi.WMI()
-        for product in c.Win32_Product():
-            for kw in keywords:
-                if kw.lower() in product.Name.lower():
-                    found.append(kw)
-    except:
-        pass
-    return list(set(found))
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall") as key:
+            for i in range(winreg.QueryInfoKey(key)[0]):
+                try:
+                    subkey_name = winreg.EnumKey(key, i)
+                    with winreg.OpenKey(key, subkey_name) as subkey:
+                        try:
+                            name = winreg.QueryValueEx(subkey, "DisplayName")[0]
+                            if any(kw.lower() in name.lower() for kw in keywords):
+                                found.add(name)
+                        except FileNotFoundError:
+                            pass
+                except WindowsError:
+                    pass
+        return list(found) if found else ["Не найдено"]
+    except Exception as e:
+        logging.error(f"Ошибка поиска ПО: {e}")
+        return ["Ошибка"]
 
 
 def check_running_processes(keywords):
-    found = []
+    """Поиск запущенных процессов по ключевым словам"""
+    found = set()
     try:
         c = wmi.WMI()
         for process in c.Win32_Process():
-            for kw in keywords:
-                if kw.lower() in process.Name.lower():
-                    found.append(kw)
-    except:
-        pass
-    return list(set(found))
+            if any(kw.lower() in process.Name.lower() for kw in keywords):
+                found.add(process.Name)
+        return list(found) if found else ["Не найдено"]
+    except Exception as e:
+        logging.error(f"Ошибка поиска процессов: {e}")
+        return ["Ошибка"]
 
 
 if __name__ == "__main__":
@@ -349,65 +421,54 @@ if __name__ == "__main__":
 
         # Диски
         partitions = get_disk_partitions()
-        if partitions:
-            print(Fore.GREEN + "\n[ДИСКИ]")
-            for disk in partitions:
-                print(f"\n▬ Физический диск #{disk.get('Номер', '?')}: {disk.get('Физический диск', 'Неизвестно')}")
-                print(f"  ├ Стиль раздела: {disk.get('Стиль раздела', 'Неизвестно')}")
-                print(f"  └ Общий размер: {disk.get('Размер', 'Н/Д')}")
+        print(Fore.GREEN + "\n[ДИСКИ]")
+        for disk in partitions:
+            print(f"\n▬ Диск #{disk.get('Номер', '?')}: {disk.get('Физический диск', 'Неизвестно')}")
+            print(f"  ├ Стиль раздела: {disk.get('Стиль раздела', 'Неизвестно')}")
+            print(f"  └ Размер: {disk.get('Размер', 'Н/Д')}")
 
-                if disk.get('Разделы'):
-                    for part in disk['Разделы']:
-                        print(f"    ├─ Раздел {part.get('Буква диска', 'Без буквы')}")
-                        print(f"    │  ├ Файловая система: {part.get('Файловая система', 'Неизвестна')}")
-                        print(f"    │  ├ Всего места: {part.get('Размер', 'Н/Д')}")
-                        print(f"    │  └ Свободно: {part.get('Свободно', 'Н/Д')}")
-                else:
-                    print(Fore.YELLOW + "    └ Нет доступных разделов")
-        else:
-            print(Fore.RED + "\n[ОШИБКА] Не удалось получить информацию о дисках")
+            for part in disk.get('Разделы', []):
+                print(f"    ├─ Раздел {part.get('Буква', 'Без буквы')}")
+                print(f"    │  ├ Файловая система: {part.get('Файловая система', 'Неизвестна')}")
+                print(f"    │  ├ Всего места: {part.get('Размер', 'Н/Д')}")
+                print(f"    │  └ Свободно: {part.get('Свободно', 'Н/Д')}")
 
-        # Информация о Windows
-
+        # Windows
         windows_info = get_windows_info()
         print(Fore.GREEN + "\n[WINDOWS]")
         for k, v in windows_info.items():
             print(f"{k.ljust(15)}: {v}")
 
-        # Информация о процессоре
+        # Процессор
         cpu_info = get_cpu_info()
         print(Fore.GREEN + "\n[ПРОЦЕССОР]")
         for k, v in cpu_info.items():
             print(f"{k.ljust(15)}: {v}")
-
-        # Информация о видеокартах
-        gpus = get_gpu_info()
-        print(Fore.GREEN + "\n[ВИДЕОКАРТЫ]")
-        for i, gpu in enumerate(gpus, 1):
-            print(f"GPU #{i}: {gpu['Модель']} ({gpu['Память']})")
 
         print_header("ПРОВЕРКА БЕЗОПАСНОСТИ")
         print_status("Secure Boot", check_secure_boot())
         print_status("TPM модуль", check_tpm())
         print_status("Виртуализация", check_virtualization())
         print_status("Изоляция ядра", check_kernel_isolation())
-        print_status("Защита DMA ядра", check_dma_protection())
+        print_status("Защита DMA", check_dma_protection())
         print_status("SmartScreen", check_smartscreen())
         print_status("Windows Defender", check_defender())
         print_status("Брандмауэр", check_firewall())
 
-        # Проверка антивирусов
-        av_list = check_installed_software(['Avast', 'Kaspersky', '360', 'McAfee'])
+        # Проверка ПО
         print(Fore.GREEN + "\n[АНТИВИРУСЫ]")
+        av_list = check_installed_software(['Avast', 'Kaspersky', 'ESET', 'Norton', 'Dr.Web'])
         print(", ".join(av_list) if av_list else "Не обнаружено")
 
-        # Проверка античитов
-        ac_list = check_installed_software(['EAC', 'BattlEye', 'FACEIT', 'VANGUARD', 'ACE'])
-        running_ac = check_running_processes(['EasyAntiCheat', 'BEService', 'Faceit', 'vgc', 'ACE'])
         print(Fore.GREEN + "\n[АНТИЧИТЫ]")
-        print(f"Установлено: {', '.join(ac_list) if ac_list else 'Нет'}")
-        print(f"Запущено: {', '.join(running_ac) if running_ac else 'Нет'}")
-        input("Нажмите Enter для выхода...")
+        ac_installed = check_installed_software(['EasyAntiCheat', 'BattlEye', 'FACEIT', 'VANGUARD'])
+        ac_running = check_running_processes(['EasyAntiCheat', 'BEService', 'Faceit', 'vgc'])
+        print(f"Установлено: {', '.join(ac_installed) if ac_installed else 'Нет'}")
+        print(f"Запущено: {', '.join(ac_running) if ac_running else 'Нет'}")
+
+        input("\nНажмите Enter для выхода...")
+
     except Exception as e:
-        print(Fore.RED + f"\nОшибка: {str(e)}")
+        logging.error(f"Критическая ошибка: {e}")
+        print(Fore.RED + f"\nПроизошла ошибка: {e}")
         input("Нажмите Enter для выхода...")
