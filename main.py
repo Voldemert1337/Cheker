@@ -1,4 +1,4 @@
-
+import webbrowser
 import re
 import wmi
 import winreg
@@ -10,6 +10,10 @@ from datetime import datetime
 from colorama import Fore, init
 import json
 import logging
+
+
+
+
 
 # Инициализация цветного вывода
 init(autoreset=True)
@@ -64,23 +68,52 @@ def print_status(item, status):
 def format_bios_date(bios_date):
     """Преобразование даты BIOS в читаемый формат"""
     try:
-        return datetime.strptime(bios_date.split('.')[0], "%Y%m%d%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.strptime(bios_date.split('.')[0], "%Y%m%d%H%M%S").strftime("%d-%m-%Y %H:%M")
     except Exception as e:
         logging.error(f"Ошибка формата даты BIOS: {e}")
         return bios_date
 
 
+
+
+def get_bios_mode():
+    """Проверка режима BIOS (UEFI или Legacy)"""
+    try:
+        # Проверка через bcdedit
+        result = subprocess.run(["bcdedit"], capture_output=True, text=True, check=True)
+
+        # Используем регулярное выражение для поиска пути \EFI\
+        if re.search(r'path\s+\\EFI\\', result.stdout):
+            return "UEFI"
+        else:
+            return "Legacy"
+    except Exception as e:
+        logging.warning(f"Не удалось определить режим BIOS: {e}")
+        return "Неизвестно"
+
 def get_bios_info():
     """Получение информации о BIOS"""
     try:
         c = wmi.WMI()
-        bios = c.Win32_BIOS()[0]
+        bios_list = c.Win32_BIOS()
+
+        if not bios_list:
+            logging.error("Не удалось найти информацию о BIOS.")
+            return {"Ошибка": "Информация о BIOS не найдена."}
+
+        bios = bios_list[0]
+        bios_characteristics = bios.BiosCharacteristics or []
+
+        # Получаем режим BIOS (UEFI или Legacy)
+        bios_mode = get_bios_mode()
+
         return {
-            "Производитель": bios.Manufacturer,
-            "Версия BIOS": bios.SMBIOSBIOSVersion,
-            "Дата BIOS": format_bios_date(bios.ReleaseDate),
-            "Режим BIOS": "UEFI" if bios.BiosCharacteristics and 41 in bios.BiosCharacteristics else "Legacy"
+            "Производитель": bios.Manufacturer or "Неизвестно",
+            "Версия BIOS": bios.SMBIOSBIOSVersion or "Неизвестно",
+            "Дата BIOS": format_bios_date(bios.ReleaseDate) or "Неизвестно",
+            "Режим BIOS": bios_mode
         }
+
     except Exception as e:
         logging.error(f"Ошибка получения информации BIOS: {e}")
         return {"Ошибка": str(e)}
@@ -585,8 +618,9 @@ if __name__ == "__main__":
     run_as_admin()
 
     try:
-
         print_headers()
+        webbrowser.open("https://gamebreaker.ru/")
+        webbrowser.open("https://t.me/gamebreakerforum")
 
         # BIOS
         bios_info = get_bios_info()
